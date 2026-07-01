@@ -1,0 +1,120 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auto-unzip source (nếu upload dạng zip qua web)
+        run: |
+          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Tìm thấy $ZIP_FILE, đang giải nén..."
+            unzip -q "$ZIP_FILE" -d /tmp/extracted
+            # Tìm thư mục con chứa build.gradle (root thật của project)
+            PROJECT_ROOT=$(find /tmp/extracted -maxdepth 3 -name "settings.gradle" -exec dirname {} \; | head -n 1)
+            if [ -z "$PROJECT_ROOT" ]; then
+              echo "❌ Không tìm thấy settings.gradle trong zip"
+              exit 1
+            fi
+            echo "Project root: $PROJECT_ROOT"
+            # Copy toàn bộ vào workspace, không đè .github (đã có sẵn workflow)
+            rsync -a --exclude='.github' "$PROJECT_ROOT"/ "$GITHUB_WORKSPACE"/
+            rm -f "$ZIP_FILE"
+            echo "✅ Giải nén xong"
+          else
+            echo "Không có file zip, dùng source đã checkout sẵn"
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 10406996
+
+      - name: Install NDK & CMake
+        run: |
+          sdkmanager --install "ndk;25.2.9519653" "cmake;3.22.1" 2>/dev/null
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libvulkan-dev glslang-tools ninja-build
+
+      - name: Cache third-party
+        uses: actions/cache@v4
+        id: tp-cache
+        with:
+          path: app/src/main/jni/third_party
+          key: tp-v3-${{ hashFiles('.github/workflows/build.yml') }}
+
+      - name: Clone third-party libraries
+        if: steps.tp-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p app/src/main/jni/third_party
+          cd app/src/main/jni/third_party
+          echo "Cloning llama.cpp..."
+          git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
+          echo "Cloning stable-diffusion.cpp..."
+          git clone --depth 1 --recurse-submodules https://github.com/leejet/stable-diffusion.cpp.git
+          echo "Cloning ncnn..."
+          git clone --depth 1 --recurse-submodules https://github.com/Tencent/ncnn.git
+          echo "Cloning stb..."
+          git clone --depth 1 https://github.com/nothings/stb.git
+
+      - name: Copy stb headers
+        run: |
+          cp app/src/main/jni/third_party/stb/stb_image.h app/src/main/jni/stb_image.h
+          cp app/src/main/jni/third_party/stb/stb_image_write.h app/src/main/jni/stb_image_write.h
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*','gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: |
+          ./gradlew assembleDebug \
+            -Pandroid.ndkVersion=25.2.9519653 \
+            --no-daemon --stacktrace 2>&1 | tail -150
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MangaLocal-v3-Full
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 60
+
+      - name: Result
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          if [ -f "$APK" ]; then
+            echo "✅ BUILD THÀNH CÔNG"
+            ls -lh "$APK"
+          else
+            echo "❌ FAILED"
+            exit 1
+          fi
