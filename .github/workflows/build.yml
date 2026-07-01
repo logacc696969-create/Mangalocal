@@ -15,7 +15,7 @@ jobs:
 
       - name: Auto-unzip source (nếu upload dạng zip qua web)
         run: |
-          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
+          ZIP_FILE=$(find . -name "*.zip" -not -path "*/.git/*" | head -n 1)
           if [ -n "$ZIP_FILE" ]; then
             echo "Tìm thấy $ZIP_FILE, đang giải nén..."
             unzip -q "$ZIP_FILE" -d /tmp/extracted
@@ -94,9 +94,10 @@ jobs:
 
       - name: Build debug APK
         run: |
+          set -o pipefail
           ./gradlew assembleDebug \
             -Pandroid.ndkVersion=25.2.9519653 \
-            --no-daemon --stacktrace 2>&1 | tail -150
+            --no-daemon --stacktrace 2>&1 | tail -300
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
           ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
