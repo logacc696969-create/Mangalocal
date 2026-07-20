@@ -19,20 +19,24 @@ jobs:
           if [ -n "$ZIP_FILE" ]; then
             echo "Tìm thấy $ZIP_FILE, đang giải nén..."
             unzip -q "$ZIP_FILE" -d /tmp/extracted
-            # Tìm thư mục con chứa build.gradle (root thật của project)
             PROJECT_ROOT=$(find /tmp/extracted -maxdepth 3 -name "settings.gradle" -exec dirname {} \; | head -n 1)
             if [ -z "$PROJECT_ROOT" ]; then
               echo "❌ Không tìm thấy settings.gradle trong zip"
               exit 1
             fi
             echo "Project root: $PROJECT_ROOT"
-            # Copy toàn bộ vào workspace, không đè .github (đã có sẵn workflow)
             rsync -a --exclude='.github' "$PROJECT_ROOT"/ "$GITHUB_WORKSPACE"/
             rm -f "$ZIP_FILE"
             echo "✅ Giải nén xong"
           else
             echo "Không có file zip, dùng source đã checkout sẵn"
           fi
+
+      - name: Install Rust toolchain (cho tokenizers-cpp, cross-compile Android)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          $HOME/.cargo/bin/rustup target add aarch64-linux-android
 
       - uses: actions/setup-java@v4
         with:
@@ -52,33 +56,68 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libvulkan-dev glslang-tools ninja-build
+          sudo apt-get install -y ninja-build
+          # KHÔNG cài libvulkan-dev/glslang-tools nữa — không còn dùng
+          # Vulkan cho sd.cpp/ncnn (đã bỏ hoàn toàn 2 engine này).
+          # MNN OpenCL tự vendor header, không cần gói hệ thống riêng.
 
       - name: Cache third-party
         uses: actions/cache@v4
         id: tp-cache
         with:
           path: app/src/main/jni/third_party
-          key: tp-v3-${{ hashFiles('.github/workflows/build.yml') }}
+          key: tp-mnn-v4-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: Clone third-party libraries
         if: steps.tp-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p app/src/main/jni/third_party
           cd app/src/main/jni/third_party
-          echo "Cloning llama.cpp..."
-          git clone --depth 1 --recurse-submodules https://github.com/ggerganov/llama.cpp.git
-          echo "Cloning stable-diffusion.cpp..."
-          git clone --depth 1 --recurse-submodules https://github.com/leejet/stable-diffusion.cpp.git
-          echo "Cloning ncnn..."
-          git clone --depth 1 --recurse-submodules https://github.com/Tencent/ncnn.git
-          echo "Cloning stb..."
+          echo "Cloning MNN (thay stable-diffusion.cpp+ncnn CHO ẢNH, thay llama.cpp CHO LLM — dùng chung 1 thư viện)..."
+          git clone --depth 1 https://github.com/alibaba/MNN.git
+          echo "Cloning stb (dùng cho ESRGAN/YOLO + SD engine đọc/ghi ảnh)..."
           git clone --depth 1 https://github.com/nothings/stb.git
+          echo "Cloning xtensor + phụ thuộc (dùng bởi sd_engine, port từ local-dream)..."
+          git clone --depth 1 https://github.com/xtensor-stack/xtl.git
+          git clone --depth 1 https://github.com/xtensor-stack/xsimd.git
+          git clone --depth 1 https://github.com/xtensor-stack/xtensor.git
+          git clone --depth 1 https://github.com/xtensor-stack/xtensor-blas.git
+          echo "Cloning tokenizers-cpp (wrapper C++ quanh tokenizer Rust)..."
+          git clone --depth 1 --recurse-submodules https://github.com/mlc-ai/tokenizers-cpp.git
+          echo "Cloning nlohmann/json (đọc model_manifest.json)..."
+          git clone --depth 1 https://github.com/nlohmann/json.git
 
       - name: Copy stb headers
         run: |
           cp app/src/main/jni/third_party/stb/stb_image.h app/src/main/jni/stb_image.h
           cp app/src/main/jni/third_party/stb/stb_image_write.h app/src/main/jni/stb_image_write.h
+          # stb_image_resize2.h: cần cho sd_engine/SDUtils.hpp (port từ
+          # local-dream) — copy vào jni/sd_engine để #include "stb_image_resize2.h"
+          # (đường dẫn tương đối) tìm thấy đúng chỗ.
+          mkdir -p app/src/main/jni/sd_engine
+          cp app/src/main/jni/third_party/stb/stb_image_resize2.h app/src/main/jni/sd_engine/stb_image_resize2.h
+          cp app/src/main/jni/third_party/stb/stb_image.h app/src/main/jni/sd_engine/stb_image.h
+          cp app/src/main/jni/third_party/stb/stb_image_write.h app/src/main/jni/sd_engine/stb_image_write.h
+
+      - name: Print MNN diffusion headers (chẩn đoán bắt buộc trước khi viết mnn_diffusion_pipeline.cpp)
+        run: |
+          echo "===== transformers/diffusion (nếu tồn tại) ====="
+          find app/src/main/jni/third_party/MNN/transformers/diffusion -type f \( -name "*.hpp" -o -name "*.h" \) 2>/dev/null -exec echo "--- {} ---" \; -exec cat {} \; || echo "KHÔNG có thư mục transformers/diffusion trong bản MNN này — cần xem lại giả định MNN_BUILD_DIFFUSION"
+          echo "===== include/MNN (API core, để tham khảo Interpreter/Session/Tensor) ====="
+          find app/src/main/jni/third_party/MNN/include/MNN -maxdepth 1 -name "*.hpp" | sort
+          echo "===== Danh sách toàn bộ file trong transformers/ (map cấu trúc thật) ====="
+          find app/src/main/jni/third_party/MNN/transformers -maxdepth 3 -type d 2>/dev/null
+
+      - name: Print sd_engine third-party header locations (chẩn đoán đường dẫn include)
+        run: |
+          echo "===== nlohmann/json — kiểm tra json.hpp nằm ở single_include hay include ====="
+          find app/src/main/jni/third_party/json -iname "json.hpp" | sort
+          echo "===== tokenizers-cpp — kiểm tra tokenizers_cpp.h nằm ở đâu ====="
+          find app/src/main/jni/third_party/tokenizers-cpp -iname "tokenizers_cpp.h" -o -iname "CMakeLists.txt" | sort
+          echo "===== xtensor/xtl/xsimd — kiểm tra header nằm ở include/ hay gốc ====="
+          find app/src/main/jni/third_party/xtensor -maxdepth 2 -type d | sort
+          find app/src/main/jni/third_party/xtl -maxdepth 2 -type d | sort
+          find app/src/main/jni/third_party/xsimd -maxdepth 2 -type d | sort
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -88,6 +127,12 @@ jobs:
             ~/.gradle/wrapper
           key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*','gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: gradle-${{ runner.os }}-
+
+      # Bước tải model MediaPipe Face Detector/Hand Landmarker ĐÃ XOÁ (mục 20
+      # TECHNICAL_STATUS.md) — FaceHandDetector.kt giờ tái dùng khung xương
+      # YOLOv8-pose (yolov8_pose.mnn, chuẩn bị qua prepare_models.yml), không
+      # còn cần model MediaPipe nào nữa. Dependency com.google.mediapipe cũng
+      # đã bỏ khỏi app/build.gradle.
 
       - name: Make gradlew executable
         run: chmod +x gradlew
@@ -105,7 +150,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MangaLocal-v3-Full
+          name: MangaLocal-v4-MNN
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 60
 
