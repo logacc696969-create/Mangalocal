@@ -1,0 +1,117 @@
+name: Prepare SD1.5 model files (.mnn) — chạy trên cloud, không cần PC
+
+# Chạy thủ công: vào tab "Actions" trên GitHub (mở được từ trình duyệt
+# điện thoại) -> chọn workflow này -> "Run workflow". Xong tải kết quả ở
+# mục "Artifacts" của lần chạy đó, giải nén, copy các file .mnn vào đúng
+# thư mục model trên điện thoại (qua Google Drive/Files app...).
+on:
+  workflow_dispatch:
+    inputs:
+      base_model:
+        description: "HuggingFace model id (SD1.5 checkpoint)"
+        default: "runwayml/stable-diffusion-v1-5"
+        required: true
+      lora_repo:
+        description: "HuggingFace LoRA repo (để trống nếu không cần) — merge LoRA lúc export, KHÔNG cần convert on-device nữa"
+        default: ""
+        required: false
+      controlnet_model:
+        default: "lllyasviel/control_v11p_sd15_openpose"
+        required: true
+      ip_adapter_repo:
+        default: "h94/IP-Adapter"
+        required: true
+
+jobs:
+  export:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cài Python deps (diffusers + MNN pip — mnnconvert có sẵn, KHÔNG cần build MNNConverter từ C++)
+        run: |
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers transformers accelerate onnx pillow numpy safetensors
+          pip install MNN
+          mnnconvert -v || echo "mnnconvert co san qua pip, khong can build MNNConverter tu C++"
+
+      - name: Export base SD1.5 (CLIP/UNet/VAE) sang ONNX rồi .mnn
+        run: |
+          python tools/export_sd15_base.py \
+            --base_model "${{ inputs.base_model }}" \
+            --lora_repo "${{ inputs.lora_repo }}" \
+            --output_dir ./exported_base
+          for name in clip unet vae_decoder vae_encoder; do
+            mnnconvert -f ONNX --modelFile ./exported_base/$name.onnx \
+              --MNNModel ./exported_base/$name.mnn --bizCode biz
+          done
+
+      - name: Export UNet augmented (IP-Adapter + ControlNet-Pose) sang ONNX rồi .mnn
+        run: |
+          python tools/export_ipa_controlnet_unet.py \
+            --base_model "${{ inputs.base_model }}" \
+            --controlnet_model "${{ inputs.controlnet_model }}" \
+            --ip_adapter_repo "${{ inputs.ip_adapter_repo }}" \
+            --output_dir ./exported_augmented
+          mnnconvert -f ONNX --modelFile ./exported_augmented/unet_ipa_controlnet.onnx \
+            --MNNModel ./exported_augmented/unet_ipa_controlnet.mnn --bizCode biz
+          mnnconvert -f ONNX --modelFile ./exported_augmented/ip_image_encoder.onnx \
+            --MNNModel ./exported_augmented/ip_image_encoder.mnn --bizCode biz
+
+      - name: Export YOLOv8-pose (thay MediaPipe Pose — mục 19 TECHNICAL_STATUS.md) sang ONNX rồi .mnn
+        run: |
+          pip install ultralytics
+          python tools/export_yolo_pose.py --model_size n --output_dir ./exported_yolo_pose
+          mnnconvert -f ONNX --modelFile ./exported_yolo_pose/yolov8_pose.onnx \
+            --MNNModel ./exported_yolo_pose/yolov8_pose.mnn --bizCode biz
+
+      - name: Tải + export 4x-UltraSharp (Hires-fix — mục 20 TECHNICAL_STATUS.md) sang ONNX rồi .mnn
+        run: |
+          pip install spandrel torch onnx
+          mkdir -p ./exported_esrgan
+          curl -L -o ./exported_esrgan/4x-UltraSharp.pth \
+            https://huggingface.co/uwg/upscaler/resolve/main/ESRGAN/4x-UltraSharp.pth
+          python tools/export_esrgan.py --checkpoint ./exported_esrgan/4x-UltraSharp.pth --output_dir ./exported_esrgan
+          mnnconvert -f ONNX --modelFile ./exported_esrgan/esrgan_upscaler.onnx \
+            --MNNModel ./exported_esrgan/realesrgan_x4.mnn --bizCode biz
+
+      - name: Export MobileSAM (mask thủ công click-to-segment — mục 21 TECHNICAL_STATUS.md) sang ONNX rồi .mnn
+        run: |
+          pip install samexporter
+          python tools/export_mobilesam.py --output_dir ./exported_mobilesam
+          mnnconvert -f ONNX --modelFile ./exported_mobilesam/mobile_sam.encoder.onnx \
+            --MNNModel ./exported_mobilesam/mobile_sam_encoder.mnn --bizCode biz
+          mnnconvert -f ONNX --modelFile ./exported_mobilesam/mobile_sam.decoder.onnx \
+            --MNNModel ./exported_mobilesam/mobile_sam_decoder.mnn --bizCode biz
+
+      # Bước tải MediaPipe Face Detector/Hand Landmarker ĐÃ XOÁ (mục 20
+      # TECHNICAL_STATUS.md — FaceHandDetector.kt tái dùng khung xương
+      # YOLOv8-pose, không cần model MediaPipe nào nữa). Trước đó chỉ xoá
+      # dòng copy ở bước đóng gói mà quên xoá hẳn bước tải này — phát hiện
+      # khi rà lại toàn bộ workflow lần cuối, đã xoá dứt điểm ở đây.
+
+      - name: Đóng gói kết quả
+        run: |
+          mkdir -p ./release
+          cp ./exported_base/*.mnn ./release/ 2>/dev/null || true
+          cp ./exported_base/tokenizer.json ./release/ 2>/dev/null || true
+          cp ./exported_base/*.bin ./release/ 2>/dev/null || true
+          cp ./exported_augmented/unet_ipa_controlnet.mnn ./release/ 2>/dev/null || true
+          cp ./exported_augmented/ip_image_encoder.mnn ./release/ 2>/dev/null || true
+          cp ./exported_yolo_pose/yolov8_pose.mnn ./release/ 2>/dev/null || true
+          cp ./exported_esrgan/realesrgan_x4.mnn ./release/ 2>/dev/null || true
+          cp ./exported_mobilesam/mobile_sam_encoder.mnn ./release/ 2>/dev/null || true
+          cp ./exported_mobilesam/mobile_sam_decoder.mnn ./release/ 2>/dev/null || true
+          ls -la ./release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MangaLocal-model-files
+          path: ./release
+          retention-days: 30
