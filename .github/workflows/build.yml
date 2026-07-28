@@ -78,10 +78,22 @@ jobs:
           echo "Cloning stb (dùng cho ESRGAN/YOLO + SD engine đọc/ghi ảnh)..."
           git clone --depth 1 https://github.com/nothings/stb.git
           echo "Cloning xtensor + phụ thuộc (dùng bởi sd_engine, port từ local-dream)..."
-          git clone --depth 1 https://github.com/xtensor-stack/xtl.git
-          git clone --depth 1 https://github.com/xtensor-stack/xsimd.git
-          git clone --depth 1 https://github.com/xtensor-stack/xtensor.git
-          git clone --depth 1 https://github.com/xtensor-stack/xtensor-blas.git
+          # GHIM VERSION — phát hiện qua log build #34: clone --depth 1 (nhánh
+          # mặc định, không ghim) đã kéo về bản xtensor MỚI HƠN đã tái cấu trúc
+          # thư mục header (0.26.0 trở đi dồn xadapt.hpp v.v. vào containers/,
+          # core/... thay vì để phẳng ngay dưới xtensor/) — trong khi
+          # sd_engine/Pipeline.hpp (port từ local-dream) viết include kiểu cũ
+          # #include <xtensor/xadapt.hpp>, không tồn tại nữa ở bản mới -> lỗi
+          # "file not found". Đây đúng là rủi ro "chưa ghim version" đã cảnh
+          # báo từ trước (xem TECHNICAL_STATUS.md mục 36) — giờ xử lý dứt điểm
+          # bằng cách ghim 4 version xtensor-stack tương thích nhau (theo đúng
+          # bảng dependency chính chủ của xtensor-stack, đã tra cứu xác nhận):
+          # xtensor 0.25.0 (bản MỚI NHẤT còn layout phẳng) cần xtl ^0.7.0 +
+          # xsimd ^10.0.0; xtensor-blas 0.21.0 cần xtensor ^0.25.0.
+          git clone --depth 1 --branch 0.7.7 https://github.com/xtensor-stack/xtl.git xtl
+          git clone --depth 1 --branch 10.0.0 https://github.com/xtensor-stack/xsimd.git xsimd
+          git clone --depth 1 --branch 0.25.0 https://github.com/xtensor-stack/xtensor.git xtensor
+          git clone --depth 1 --branch 0.21.0 https://github.com/xtensor-stack/xtensor-blas.git xtensor-blas
           echo "Cloning tokenizers-cpp (wrapper C++ quanh tokenizer Rust)..."
           git clone --depth 1 --recurse-submodules https://github.com/mlc-ai/tokenizers-cpp.git
           echo "Cloning nlohmann/json (đọc model_manifest.json)..."
