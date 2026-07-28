@@ -87,6 +87,31 @@ jobs:
           echo "Cloning nlohmann/json (đọc model_manifest.json)..."
           git clone --depth 1 https://github.com/nlohmann/json.git
 
+      - name: Vá CMakeLists.txt của MNN — OBJECT không được gắn PRE_BUILD/POST_BUILD (lỗi CXX1429)
+        run: |
+          # Lỗi build đầu tiên (xem log_build_fail.txt): CMake 3.22.1 từ chối
+          # add_custom_command(POST_BUILD) trên target kiểu OBJECT library.
+          # 2 target lỗi: MNNOpenCV (tools/cv/CMakeLists.txt) và llm
+          # (transformers/llm/engine/CMakeLists.txt) — cả 2 đều gọi
+          # add_custom_command(POST_BUILD ...) ngay sau add_library(... OBJECT ...)
+          # trong nhánh MNN_SEP_BUILD=OFF (nhánh mặc định của project này).
+          # Đây là lỗi trong chính CMakeLists.txt của MNN (đã xảy ra với target
+          # khác từ 2022, đã tra cứu trước đó), không phải file project viết —
+          # nên vá ngay sau khi clone, không đụng gì trong repo MNN gốc trừ 2 dòng này.
+          # Cách sửa: đổi OBJECT -> STATIC cho đúng 2 dòng add_library() gây lỗi
+          # (STATIC được phép gắn PRE_BUILD/POST_BUILD, OBJECT thì không).
+          MNN_DIR="app/src/main/jni/third_party/MNN"
+
+          CV_FILE="$MNN_DIR/tools/cv/CMakeLists.txt"
+          grep -q 'add_library(MNNOpenCV OBJECT' "$CV_FILE" || { echo "❌ Không tìm thấy dòng add_library(MNNOpenCV OBJECT ...) — MNN có thể đã đổi cấu trúc, cần rà lại"; exit 1; }
+          sed -i 's/add_library(MNNOpenCV OBJECT/add_library(MNNOpenCV STATIC/' "$CV_FILE"
+          echo "✅ Vá MNNOpenCV: OBJECT -> STATIC"
+
+          LLM_FILE="$MNN_DIR/transformers/llm/engine/CMakeLists.txt"
+          grep -q 'add_library(llm OBJECT' "$LLM_FILE" || { echo "❌ Không tìm thấy dòng add_library(llm OBJECT ...) — MNN có thể đã đổi cấu trúc, cần rà lại"; exit 1; }
+          sed -i 's/add_library(llm OBJECT/add_library(llm STATIC/' "$LLM_FILE"
+          echo "✅ Vá llm: OBJECT -> STATIC"
+
       - name: Copy stb headers
         run: |
           cp app/src/main/jni/third_party/stb/stb_image.h app/src/main/jni/stb_image.h
