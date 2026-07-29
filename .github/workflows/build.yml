@@ -74,7 +74,16 @@ jobs:
           mkdir -p app/src/main/jni/third_party
           cd app/src/main/jni/third_party
           echo "Cloning MNN (thay stable-diffusion.cpp+ncnn CHO ẢNH, thay llama.cpp CHO LLM — dùng chung 1 thư viện)..."
-          git clone --depth 1 https://github.com/alibaba/MNN.git
+          # GHIM VERSION (sau lỗi build #59 — xem ghi chú trong bước "Vá
+          # CMakeLists.txt của MNN" bên dưới): trước đây `git clone --depth 1`
+          # không ghim nhánh cụ thể, nên mỗi lần cache miss sẽ kéo về đúng
+          # bản MỚI NHẤT của MNN tại thời điểm đó — một ngày nào đó MNN đổi
+          # cấu trúc CMakeLists.txt là cả workflow sập, y hệt rủi ro đã từng
+          # gặp với xtensor (mục 36 TECHNICAL_STATUS.md) chỉ khác là lần này
+          # là MNN. Ghim vào 3.6.1 (bản ổn định mới nhất đã kiểm tra hoạt
+          # động được với project này) để build không còn phụ thuộc vào
+          # đúng lúc nào GitHub cache bị miss nữa.
+          git clone --depth 1 --branch 3.6.1 https://github.com/alibaba/MNN.git
           echo "Cloning stb (dùng cho ESRGAN/YOLO + SD engine đọc/ghi ảnh)..."
           git clone --depth 1 https://github.com/nothings/stb.git
           echo "Cloning xtensor + phụ thuộc (dùng bởi sd_engine, port từ local-dream)..."
@@ -112,17 +121,40 @@ jobs:
           # nên vá ngay sau khi clone, không đụng gì trong repo MNN gốc trừ 2 dòng này.
           # Cách sửa: đổi OBJECT -> STATIC cho đúng 2 dòng add_library() gây lỗi
           # (STATIC được phép gắn PRE_BUILD/POST_BUILD, OBJECT thì không).
+          # SỬA (sau lỗi build #59): trước đây 2 bước vá dưới đây BẮT BUỘC
+          # phải tìm thấy đúng dòng "add_library(... OBJECT ..." rồi mới cho
+          # build tiếp — nếu không thấy thì exit 1, sập cả workflow. Nhưng
+          # MNN được clone bằng `--depth 1` KHÔNG ghim version (khác xtensor —
+          # xem ghi chú ghim version phía trên), nên mỗi lần cache miss là
+          # kéo về bản MNN MỚI NHẤT tại thời điểm đó, có thể khác hẳn bản đã
+          # dùng lúc viết patch này. Build #59 chứng minh đúng điều đó: MNN
+          # mới đã tự đổi tools/cv/CMakeLists.txt — thực ra KHÔNG CÒN CẦN vá
+          # MNNOpenCV nữa vì project này set MNN_BUILD_OPENCV=OFF, và bản MNN
+          # hiện tại đã tự gói add_subdirectory(tools/cv) trong
+          # IF(MNN_BUILD_OPENCV) — OFF thì CMake không đọc file đó nữa, nên
+          # dò không thấy dòng cũ là chuyện BÌNH THƯỜNG, không phải lỗi.
+          # Đổi cả 2 bước thành "vá nếu thấy, bỏ qua + cảnh báo nếu không
+          # thấy" thay vì chết cứng — nếu MNN_BUILD_LLM=ON mà bản mới vẫn còn
+          # lỗi CXX1429 thật, nó sẽ lộ ra ở đúng bước build native bên dưới
+          # với thông báo lỗi CMake gốc, dễ chẩn đoán hơn nhiều so với việc
+          # cả workflow chết ngay từ bước vá này.
           MNN_DIR="app/src/main/jni/third_party/MNN"
 
           CV_FILE="$MNN_DIR/tools/cv/CMakeLists.txt"
-          grep -q 'add_library(MNNOpenCV OBJECT' "$CV_FILE" || { echo "❌ Không tìm thấy dòng add_library(MNNOpenCV OBJECT ...) — MNN có thể đã đổi cấu trúc, cần rà lại"; exit 1; }
-          sed -i 's/add_library(MNNOpenCV OBJECT/add_library(MNNOpenCV STATIC/' "$CV_FILE"
-          echo "✅ Vá MNNOpenCV: OBJECT -> STATIC"
+          if grep -q 'add_library(MNNOpenCV OBJECT' "$CV_FILE"; then
+            sed -i 's/add_library(MNNOpenCV OBJECT/add_library(MNNOpenCV STATIC/' "$CV_FILE"
+            echo "✅ Vá MNNOpenCV: OBJECT -> STATIC"
+          else
+            echo "⚠️  Không thấy dòng add_library(MNNOpenCV OBJECT ...) trong bản MNN này — bỏ qua bước vá (project set MNN_BUILD_OPENCV=OFF nên file này có thể không còn được CMake đọc tới; không phải lỗi)."
+          fi
 
           LLM_FILE="$MNN_DIR/transformers/llm/engine/CMakeLists.txt"
-          grep -q 'add_library(llm OBJECT' "$LLM_FILE" || { echo "❌ Không tìm thấy dòng add_library(llm OBJECT ...) — MNN có thể đã đổi cấu trúc, cần rà lại"; exit 1; }
-          sed -i 's/add_library(llm OBJECT/add_library(llm STATIC/' "$LLM_FILE"
-          echo "✅ Vá llm: OBJECT -> STATIC"
+          if grep -q 'add_library(llm OBJECT' "$LLM_FILE"; then
+            sed -i 's/add_library(llm OBJECT/add_library(llm STATIC/' "$LLM_FILE"
+            echo "✅ Vá llm: OBJECT -> STATIC"
+          else
+            echo "⚠️  Không thấy dòng add_library(llm OBJECT ...) trong bản MNN này — bỏ qua bước vá. Nếu bản MNN mới vẫn còn lỗi CXX1429 thật cho target 'llm', nó sẽ hiện rõ ở bước build native bên dưới."
+          fi
 
       - name: Copy stb headers
         run: |
