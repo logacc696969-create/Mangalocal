@@ -4,6 +4,20 @@ on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      enable_qnn:
+        description: "Bật QNN NPU (mục 63 TECHNICAL_STATUS.md) — CẦN secret QNN_SDK_BASE64 (Qualcomm SDK, tự chuẩn bị — xem HUONG_DAN_NPU_QNN.md Phần 2, KHÔNG có workflow convert_qnn_offline.yml riêng, quyết định mục 90 TECHNICAL_STATUS.md: dùng notebook mangalocal_qnn_convert.ipynb chạy trên Kaggle thay vì GitHub Actions cho việc convert model). Để false nếu không có SDK, build vẫn ra APK bình thường (CPU/OpenCL, giống mặc định từ trước)."
+        default: false
+        type: boolean
+        required: false
+      qnn_mode:
+        description: "Chỉ dùng nếu enable_qnn=true — 'online' (biên dịch lúc chạy, đơn giản hơn) hoặc 'offline' (nạp file convert sẵn, đúng cách local-dream dùng — xem mục 62)"
+        default: "online"
+        required: false
+      qnn_hexagon_arch:
+        description: "Chỉ dùng nếu enable_qnn=true — HEXAGON_ARCH đích (SM8350/Snapdragon 888=68 — máy dev chính của dự án, mục 65; 8Gen1=69, 8Gen2=73, 8Gen3=75, 8Elite=79). CHỈ ảnh hưởng chế độ 'online' (chế độ 'offline' không cần vì mỗi model .mnn tự mang đúng kiến trúc đã convert)."
+        default: "68"
+        required: false
 
 jobs:
   build:
@@ -43,10 +57,25 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      # mục 210 TECHNICAL_STATUS.md — Build APK #112 THẬT (log user gửi) lỗi
+      # NGAY ở bước này, KHÔNG liên quan gì code mục 203-209 — lỗi hạ tầng
+      # CI: `android-actions/setup-android@v3` mặc định tự chạy
+      # `sdkmanager tools platform-tools` bên trong action, và Google đã
+      # NGỪNG phục vụ gói `tools` (cũ, deprecated từ lâu) khỏi repository
+      # SDK trong vài ngày gần đây — lỗi "Warning: Failed to find package
+      # 'tools'" xảy ra HÀNG LOẠT trên rất nhiều repo khác (đã tra chéo 8
+      # nguồn độc lập trên GitHub — cùng triệu chứng, cùng bản chất, cùng
+      # cách vá: truyền `packages:` tường minh để bỏ hẳn "tools" khỏi danh
+      # sách action tự cài, KHÔNG đổi hành vi gì khác). Dự án này vốn
+      # không cần gói `tools` cũ (Gradle build hiện đại không dùng) —
+      # `platform-tools` giữ lại vì các dự án tham khảo đều giữ (an toàn
+      # hơn dùng chuỗi rỗng), bước "Install NDK & CMake" ngay dưới không
+      # đổi gì.
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: 10406996
+          packages: "platform-tools"
 
       - name: Install NDK & CMake
         run: |
@@ -203,14 +232,47 @@ jobs:
       # còn cần model MediaPipe nào nữa. Dependency com.google.mediapipe cũng
       # đã bỏ khỏi app/build.gradle.
 
+      - name: Giải nén QNN SDK nếu bật enable_qnn (mục 63 TECHNICAL_STATUS.md)
+        if: ${{ github.event.inputs.enable_qnn == 'true' }}
+        env:
+          QNN_SDK_BASE64: ${{ secrets.QNN_SDK_BASE64 }}
+        run: |
+          if [ -z "$QNN_SDK_BASE64" ]; then
+            echo "❌ enable_qnn=true nhưng thiếu secret QNN_SDK_BASE64."
+            echo "   Không có workflow convert_qnn_offline.yml riêng cho việc này"
+            echo "   (mục 90 TECHNICAL_STATUS.md — quyết định dùng notebook"
+            echo "   mangalocal_qnn_convert.ipynb chạy trên Kaggle thay vì GitHub"
+            echo "   Actions). Xem HUONG_DAN_NPU_QNN.md Phần 2 để biết cách tải"
+            echo "   QNN SDK từ Qualcomm rồi tự base64 -w0 file .zip đó và lưu"
+            echo "   vào đúng secret QNN_SDK_BASE64 (Settings -> Secrets and"
+            echo "   variables -> Actions) trước khi chạy lại workflow này."
+            exit 1
+          fi
+          echo "$QNN_SDK_BASE64" | base64 -d > qnn_sdk.zip
+          mkdir -p qnn_sdk
+          unzip -q qnn_sdk.zip -d qnn_sdk
+          QNN_ROOT=$(find qnn_sdk -maxdepth 3 -type d -name "lib" -exec dirname {} \; | head -n 1)
+          if [ -z "$QNN_ROOT" ]; then
+            echo "❌ Không tìm thấy thư mục 'lib' trong QNN SDK đã giải nén"
+            exit 1
+          fi
+          echo "QNN_SDK_ROOT_RESOLVED=$QNN_ROOT" >> $GITHUB_ENV
+          echo "✅ QNN SDK root: $QNN_ROOT"
+
       - name: Make gradlew executable
         run: chmod +x gradlew
 
       - name: Build debug APK
         run: |
           set -o pipefail
+          QNN_GRADLE_ARGS=""
+          if [ "${{ github.event.inputs.enable_qnn }}" = "true" ]; then
+            QNN_GRADLE_ARGS="-Pmangalocal.enableQnn=true -Pmangalocal.qnnSdkRoot=$QNN_SDK_ROOT_RESOLVED -Pmangalocal.qnnMode=${{ github.event.inputs.qnn_mode || 'online' }} -Pmangalocal.qnnHexagonArch=${{ github.event.inputs.qnn_hexagon_arch || '68' }}"
+            echo "Build voi QNN: $QNN_GRADLE_ARGS"
+          fi
           ./gradlew assembleDebug \
             -Pandroid.ndkVersion=25.2.9519653 \
+            $QNN_GRADLE_ARGS \
             --no-daemon --stacktrace 2>&1 | tail -300
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
