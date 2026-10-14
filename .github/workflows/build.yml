@@ -51,6 +51,10 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           $HOME/.cargo/bin/rustup target add aarch64-linux-android
+          # mục 252 — in phiên bản Rust/cargo THẬT đang dùng (toolchain "stable" không ghim,
+          # đổi theo thời gian) để lần sau lỗi cargo/tokenizers-cpp có số phiên bản để đối chiếu.
+          $HOME/.cargo/bin/rustc --version
+          $HOME/.cargo/bin/cargo --version
 
       - uses: actions/setup-java@v4
         with:
@@ -95,13 +99,47 @@ jobs:
         id: tp-cache
         with:
           path: app/src/main/jni/third_party
-          key: tp-mnn-v4-${{ hashFiles('.github/workflows/build.yml') }}
+          key: tp-mnn-v5-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: Clone third-party libraries
         if: steps.tp-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p app/src/main/jni/third_party
           cd app/src/main/jni/third_party
+          # mục 252 TECHNICAL_STATUS.md — GHIM THEO NGÀY cho các repo không có tag ổn định
+          # (stb, tokenizers-cpp). Bằng chứng từ log Build #123: bước "Cache third-party" 1s
+          # (không có gì để tải) + bước "Clone third-party libraries" 17s => cache BỊ MISS và
+          # 3 repo không ghim (stb, tokenizers-cpp+submodule, nlohmann/json) đã bị clone lại ở
+          # bản MỚI NHẤT — đúng rủi ro từng gây build #34 (xtensor) và #59 (MNN). Cache chỉ
+          # được GHI khi job thành công và bị xoá sau 7 ngày không dùng, nên chuỗi build lỗi
+          # liên tiếp làm cache không bao giờ được dựng lại. Hàm dưới checkout commit CUỐI CÙNG
+          # trước mốc 2026-09-19 (ngày build #117/#118 còn PASS); nếu không dựng được lịch sử
+          # (repo ít commit) thì RƠI VỀ hành vi cũ (--depth 1) — không bao giờ làm clone hỏng.
+          CUTOFF="2026-09-19T00:00:00Z"
+          clone_at_cutoff() {
+            local url="$1" dir="$2" recurse="$3"
+            if git clone --shallow-since="2026-01-01" "$url" "$dir" 2>/dev/null; then
+              ( cd "$dir"
+                sha=$(git rev-list -n 1 --before="$CUTOFF" HEAD 2>/dev/null || true)
+                if [ -n "$sha" ]; then
+                  git checkout -q "$sha" && echo "  $dir ghim tại $sha (<= $CUTOFF)"
+                else
+                  echo "  $dir: không có commit nào trước mốc trong lịch sử tải về — giữ HEAD"
+                fi
+                if [ "$recurse" = "1" ]; then
+                  git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+                fi
+              )
+            else
+              rm -rf "$dir"
+              echo "  $dir: --shallow-since không dùng được — rơi về clone --depth 1 (HEAD)"
+              if [ "$recurse" = "1" ]; then
+                git clone --depth 1 --recurse-submodules "$url" "$dir"
+              else
+                git clone --depth 1 "$url" "$dir"
+              fi
+            fi
+          }
           echo "Cloning MNN (thay stable-diffusion.cpp+ncnn CHO ẢNH, thay llama.cpp CHO LLM — dùng chung 1 thư viện)..."
           # GHIM VERSION (sau lỗi build #59 — xem ghi chú trong bước "Vá
           # CMakeLists.txt của MNN" bên dưới): trước đây `git clone --depth 1`
@@ -114,7 +152,7 @@ jobs:
           # đúng lúc nào GitHub cache bị miss nữa.
           git clone --depth 1 --branch 3.6.1 https://github.com/alibaba/MNN.git
           echo "Cloning stb (dùng cho ESRGAN/YOLO + SD engine đọc/ghi ảnh)..."
-          git clone --depth 1 https://github.com/nothings/stb.git
+          clone_at_cutoff https://github.com/nothings/stb.git stb 0
           echo "Cloning xtensor + phụ thuộc (dùng bởi sd_engine, port từ local-dream)..."
           # GHIM VERSION — phát hiện qua log build #34: clone --depth 1 (nhánh
           # mặc định, không ghim) đã kéo về bản xtensor MỚI HƠN đã tái cấu trúc
@@ -133,9 +171,11 @@ jobs:
           git clone --depth 1 --branch 0.25.0 https://github.com/xtensor-stack/xtensor.git xtensor
           git clone --depth 1 --branch 0.21.0 https://github.com/xtensor-stack/xtensor-blas.git xtensor-blas
           echo "Cloning tokenizers-cpp (wrapper C++ quanh tokenizer Rust)..."
-          git clone --depth 1 --recurse-submodules https://github.com/mlc-ai/tokenizers-cpp.git
+          clone_at_cutoff https://github.com/mlc-ai/tokenizers-cpp.git tokenizers-cpp 1
           echo "Cloning nlohmann/json (đọc model_manifest.json)..."
-          git clone --depth 1 https://github.com/nlohmann/json.git
+          # nlohmann/json: nhánh mặc định là `develop` (tiền-phát-hành 4.0) — dùng tag ổn định.
+          # Dự án chỉ dùng parse()/exception cơ bản (mnn_diffusion_pipeline.cpp, SafeTensorReader.hpp).
+          git clone --depth 1 --branch v3.11.3 https://github.com/nlohmann/json.git
 
       - name: Vá CMakeLists.txt của MNN — OBJECT không được gắn PRE_BUILD/POST_BUILD (lỗi CXX1429)
         run: |
@@ -262,21 +302,89 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      # mục 252 — biên dịch RIÊNG Kotlin (không cần native, nhanh) TRƯỚC build đầy đủ.
+      # Lý do: khi bước native lỗi, Gradle dừng và KHÔNG ai biết Kotlin (23 file mới/sửa từ
+      # mục 214 đến 251, chưa từng qua kotlinc) có lỗi hay không. continue-on-error: không
+      # chặn bước build bên dưới; chỉ để lộ lỗi Kotlin ngay trong lần chạy này.
+      - name: Kotlin preflight (compileDebugKotlin riêng — chỉ để lộ lỗi sớm)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./gradlew :app:compileDebugKotlin \
+            -Pandroid.ndkVersion=25.2.9519653 \
+            --no-daemon 2>&1 | tee kotlin_preflight.log | grep -E "^e: |BUILD (SUCCESSFUL|FAILED)|What went wrong|Execution failed" | head -100 | cut -c1-500 || true
+          echo "(log Kotlin đầy đủ: kotlin_preflight.log — được upload nếu job lỗi)"
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
+
       - name: Build debug APK
         run: |
           set -o pipefail
+          echo "=== Tài nguyên runner ==="; nproc; free -m | head -2
           QNN_GRADLE_ARGS=""
           if [ "${{ github.event.inputs.enable_qnn }}" = "true" ]; then
             QNN_GRADLE_ARGS="-Pmangalocal.enableQnn=true -Pmangalocal.qnnSdkRoot=$QNN_SDK_ROOT_RESOLVED -Pmangalocal.qnnMode=${{ github.event.inputs.qnn_mode || 'online' }} -Pmangalocal.qnnHexagonArch=${{ github.event.inputs.qnn_hexagon_arch || '68' }}"
             echo "Build voi QNN: $QNN_GRADLE_ARGS"
           fi
+          # mục 252 — TRƯỚC ĐÂY: `--stacktrace 2>&1 | tail -300`. Stack trace Gradle dài hàng
+          # trăm dòng nên `tail -300` CẮT MẤT thông báo lỗi gốc của ninja/clang nằm ở đầu
+          # ngoại lệ (log Build #123 chỉ còn phần đuôi stack trace + "BUILD FAILED", không có
+          # dòng "FAILED:"/"error:"). Nay: ghi log ĐẦY ĐỦ ra build_full.log (không --stacktrace,
+          # không tail) rồi hai bước `if: failure()` bên dưới in tóm tắt lỗi ở CUỐI log.
           ./gradlew assembleDebug \
             -Pandroid.ndkVersion=25.2.9519653 \
             $QNN_GRADLE_ARGS \
-            --no-daemon --stacktrace 2>&1 | tail -300
+            --no-daemon 2>&1 | tee build_full.log
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
           ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
+
+      - name: "[CHỈ KHI LỖI] Tóm tắt dòng lỗi từ log đầy đủ"
+        if: failure()
+        run: |
+          [ -f build_full.log ] || { echo "Không có build_full.log (lỗi xảy ra trước bước Gradle)"; exit 0; }
+          echo "=== Dòng lỗi trong build_full.log (tối đa 150) ==="
+          grep -nE "^e: |error:|^FAILED:|undefined (reference|symbol)|ld\.lld: error|clang(\+\+)?: error|Killed|What went wrong|Execution failed|cargo|rustc" build_full.log | head -150 | cut -c1-500 || true
+
+      # mục 252 — chạy lại ninja ĐÚNG danh sách target mà Gradle đã gọi nhưng với `-k 0`
+      # (không dừng ở lỗi đầu tiên → liệt kê MỌI file lỗi trong MỘT lần chạy) và `-j2`
+      # (nếu lần này KHÔNG lỗi nữa => nguyên nhân gốc là HẾT BỘ NHỚ khi biên dịch song song).
+      # Các file đã biên dịch xong ở lần trước được dùng lại nên bước này nhanh.
+      - name: "[CHỈ KHI LỖI] Liệt kê TOÀN BỘ lỗi native (ninja -k 0 -j2)"
+        if: failure()
+        continue-on-error: true
+        run: |
+          echo "=== Bộ nhớ/CPU runner ==="; nproc; free -m | head -2
+          sudo dmesg 2>/dev/null | grep -iE "out of memory|killed process" | tail -5 || true
+          BD=$(ls -d app/.cxx/Debug/*/arm64-v8a 2>/dev/null | head -1)
+          if [ -z "$BD" ]; then echo "Không thấy thư mục build native — lỗi xảy ra trước bước native."; exit 0; fi
+          NINJA="$ANDROID_SDK_ROOT/cmake/3.22.1/bin/ninja"
+          [ -x "$NINJA" ] || NINJA=ninja
+          ARGS=$(grep -m1 -o 'bin/ninja with arguments {[^}]*}' build_full.log 2>/dev/null | sed 's/.*{\(.*\)}/\1/' || true)
+          [ -n "$ARGS" ] || ARGS="-C $BD mangalocal_native"
+          echo "ninja -k 0 -j2 $ARGS"
+          set +e
+          "$NINJA" -k 0 -j2 $ARGS > ninja_k0.log 2>&1
+          echo "Mã thoát ninja -k 0 -j2: $?"
+          echo "=== Mọi lệnh lỗi (FAILED:) ==="
+          grep -n "^FAILED:" ninja_k0.log | cut -c1-300
+          echo "=== Chi tiết lỗi (tối đa 200 dòng) ==="
+          grep -nE "error:|undefined (reference|symbol)|ld\.lld: error|Killed|fatal" ninja_k0.log | head -200 | cut -c1-500
+          echo "=== 40 dòng cuối ninja_k0.log ==="
+          tail -40 ninja_k0.log | cut -c1-500
+
+      - name: "[CHỈ KHI LỖI] Upload log lỗi"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build_full.log
+            kotlin_preflight.log
+            ninja_k0.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
