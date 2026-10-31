@@ -5,6 +5,16 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
     inputs:
+      enable_vlm:
+        description: "Bật MNN-LLM nhìn-hiểu ảnh (mục 259) — giám khảo VLM cho kiểm tra sau sinh. Thay đổi build MNN lớn (OpenCV + imgcodecs), CHƯA từng chạy trên CI: nếu lỗi, chạy lại với tuỳ chọn này TẮT."
+        default: false
+        type: boolean
+        required: false
+      enable_lora_module:
+        description: "Bật đường module LoRA tách rời (mục 270) — UNet chạy bằng MNN Module, LoRA *.lora.mnn chia sẻ trọng số nền. Mã native MỚI, CHƯA từng biên dịch với MNN thật: nếu lỗi, chạy lại với tuỳ chọn này TẮT."
+        default: false
+        type: boolean
+        required: false
       enable_qnn:
         description: "Bật QNN NPU (mục 63 TECHNICAL_STATUS.md) — CẦN secret QNN_SDK_BASE64 (Qualcomm SDK, tự chuẩn bị — xem HUONG_DAN_NPU_QNN.md Phần 2, KHÔNG có workflow convert_qnn_offline.yml riêng, quyết định mục 90 TECHNICAL_STATUS.md: dùng notebook mangalocal_qnn_convert.ipynb chạy trên Kaggle thay vì GitHub Actions cho việc convert model). Để false nếu không có SDK, build vẫn ra APK bình thường (CPU/OpenCL, giống mặc định từ trước)."
         default: false
@@ -323,6 +333,16 @@ jobs:
           set -o pipefail
           echo "=== Tài nguyên runner ==="; nproc; free -m | head -2
           QNN_GRADLE_ARGS=""
+          VLM_GRADLE_ARGS=""
+          LORA_MODULE_GRADLE_ARGS=""
+          if [ "${{ github.event.inputs.enable_lora_module }}" = "true" ]; then
+            LORA_MODULE_GRADLE_ARGS="-Pmangalocal.enableLoraModule=true"
+            echo "Build voi module LoRA (MNN Module): $LORA_MODULE_GRADLE_ARGS"
+          fi
+          if [ "${{ github.event.inputs.enable_vlm }}" = "true" ]; then
+            VLM_GRADLE_ARGS="-Pmangalocal.enableVlm=true"
+            echo "Build voi VLM (MNN-LLM omni): $VLM_GRADLE_ARGS"
+          fi
           if [ "${{ github.event.inputs.enable_qnn }}" = "true" ]; then
             QNN_GRADLE_ARGS="-Pmangalocal.enableQnn=true -Pmangalocal.qnnSdkRoot=$QNN_SDK_ROOT_RESOLVED -Pmangalocal.qnnMode=${{ github.event.inputs.qnn_mode || 'online' }} -Pmangalocal.qnnHexagonArch=${{ github.event.inputs.qnn_hexagon_arch || '68' }}"
             echo "Build voi QNN: $QNN_GRADLE_ARGS"
@@ -335,6 +355,8 @@ jobs:
           ./gradlew assembleDebug \
             -Pandroid.ndkVersion=25.2.9519653 \
             $QNN_GRADLE_ARGS \
+            $VLM_GRADLE_ARGS \
+            $LORA_MODULE_GRADLE_ARGS \
             --no-daemon 2>&1 | tee build_full.log
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
