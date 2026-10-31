@@ -341,7 +341,7 @@ jobs:
           fi
           if [ "${{ github.event.inputs.enable_vlm }}" = "true" ]; then
             VLM_GRADLE_ARGS="-Pmangalocal.enableVlm=true"
-            echo "Build voi VLM (MNN-LLM omni): $VLM_GRADLE_ARGS"
+            echo "Build voi VLM (MNN-LLM chi nhin anh, khong audio): $VLM_GRADLE_ARGS"
           fi
           if [ "${{ github.event.inputs.enable_qnn }}" = "true" ]; then
             QNN_GRADLE_ARGS="-Pmangalocal.enableQnn=true -Pmangalocal.qnnSdkRoot=$QNN_SDK_ROOT_RESOLVED -Pmangalocal.qnnMode=${{ github.event.inputs.qnn_mode || 'online' }} -Pmangalocal.qnnHexagonArch=${{ github.event.inputs.qnn_hexagon_arch || '68' }}"
